@@ -54,7 +54,8 @@
 		"@earendil-works/pi-coding-agent": "^0.30.2",
 		"@earendil-works/pi-web-ui": "^0.74.0",
 		"get-east-asian-width": "^1.4.0",
-		"googleapis": "^171.4.0"
+		"googleapis": "^171.4.0",
+		"ws": "^8.20.1"
 	},
 	"overrides": {
 		"rimraf": "6.1.2",
