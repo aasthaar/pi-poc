@@ -572,8 +572,11 @@ function buildParams(
 			openRouterParams.reasoning = {
 				effort: model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort,
 			};
-		} else if (model.thinkingLevelMap?.off !== null) {
-			openRouterParams.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
+		} else {
+			const offValue = model.thinkingLevelMap?.off;
+			if (typeof offValue === "string") {
+				openRouterParams.reasoning = { effort: offValue };
+			}
 		}
 	} else if (compat.thinkingFormat === "together" && model.reasoning) {
 		const togetherParams = params as Omit<typeof params, "reasoning_effort"> & {

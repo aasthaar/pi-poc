@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed OpenRouter reasoning effort mapping to avoid sending `reasoning: { effort: "none" }` when the model has no configured thinking level map, preventing 400 errors for models where reasoning is mandatory.
 - Fixed GitHub Copilot Claude test coverage to use the current Claude Sonnet 4.6 model ID.
 - Fixed OpenAI Responses requests for models that support disabling reasoning to send `reasoning.effort: "none"` when thinking is off.
 
