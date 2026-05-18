@@ -63,69 +63,339 @@ server.listen(PORT, () => {
   console.log(`[server] You can now open http://localhost:${PORT} in your browser.\n`);
 });
 
+const activeSessions = new Map(); // sessionId -> { id, title, msgCount, created, filePath, manager, session: null, extensionsResult: null }
+
+// Helper to lazily boot the AgentSession when needed
+async function ensureSessionBooted(sessionData) {
+  if (sessionData.session) return sessionData.session;
+  
+  console.log(`[server] Lazily booting AgentSession for ID: ${sessionData.id}`);
+  const skillPaths = [path.join(__dirname, ".pi", "skills")];
+  const extensionPaths = [path.join(__dirname, ".pi", "extensions")];
+  const services = await createAgentSessionServices({ 
+    cwd: CWD,
+    resourceLoaderOptions: {
+      additionalSkillPaths: skillPaths,
+      additionalExtensionPaths: extensionPaths
+    }
+  });
+  await services.resourceLoader.reload();
+  
+  const result = await createAgentSession({
+    resourceLoader: services.resourceLoader,
+    model:        MODEL,
+    authStorage,
+    modelRegistry,
+    sessionManager: sessionData.manager
+  });
+  
+  sessionData.session = result.session;
+  sessionData.extensionsResult = result.extensionsResult;
+  
+  await result.session.bindExtensions({});
+  return result.session;
+}
+
+// Initial directory scan to load persisted session headers
+try {
+  const agentDir = getAgentDir();
+  const safePath = `--${CWD.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  const sessionDir = path.join(agentDir, "sessions", safePath);
+  
+  if (fs.existsSync(sessionDir)) {
+    const files = fs.readdirSync(sessionDir)
+      .filter(f => f.endsWith(".jsonl"))
+      .map(f => path.join(sessionDir, f));
+      
+    console.log(`[server] Found ${files.length} existing sessions on disk.`);
+    
+    for (const filePath of files) {
+      try {
+        const mgr = SessionManager.open(filePath);
+        const header = mgr.getHeader();
+        if (!header) continue;
+        
+        const id = header.id;
+        const created = new Date(header.timestamp).getTime();
+        const entries = mgr.getEntries();
+        
+        let firstMsg = "";
+        let msgCount = 0;
+        for (const entry of entries) {
+          if (entry.type === "message") {
+            msgCount++;
+            if (!firstMsg && entry.message.role === "user") {
+              const content = entry.message.content;
+              if (typeof content === "string") {
+                firstMsg = content;
+              } else if (Array.isArray(content)) {
+                firstMsg = content.filter(c => c.type === "text").map(c => c.text).join("");
+              }
+            }
+          }
+        }
+        
+        const title = mgr.getSessionName() || firstMsg || "New session";
+        
+        activeSessions.set(id, {
+          id,
+          title,
+          msgCount,
+          created,
+          filePath,
+          manager: mgr,
+          session: null,
+          extensionsResult: null
+        });
+      } catch (err) {
+        console.error(`[server] Failed to load session file ${filePath}:`, err);
+      }
+    }
+  }
+} catch (err) {
+  console.error("[server] Failed to scan session directory:", err);
+}
+
+function getHistory(session) {
+  if (!session || !session.sessionManager) return [];
+  const context = session.sessionManager.buildSessionContext();
+  if (!context || !context.messages) return [];
+  
+  return context.messages
+    .filter(msg => msg.role === "user" || msg.role === "assistant")
+    .map(msg => {
+      const historyMsg = {
+        role: msg.role,
+        timestamp: msg.timestamp || Date.now()
+      };
+      
+      if (msg.role === "user") {
+        let text = "";
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          text = msg.content.filter(c => c.type === "text").map(c => c.text).join("");
+        }
+        historyMsg.content = text;
+      } else if (msg.role === "assistant") {
+        historyMsg.content = "";
+        historyMsg.thinking = "";
+        historyMsg.toolCalls = [];
+        
+        if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === "text") {
+              historyMsg.content += block.text;
+            } else if (block.type === "thinking") {
+              historyMsg.thinking += block.thinking;
+            } else if (block.type === "toolCall") {
+              historyMsg.toolCalls.push({
+                id: block.id,
+                name: block.name,
+                arguments: block.arguments
+              });
+            }
+          }
+        }
+        if (typeof msg.content === "string") {
+          historyMsg.content = msg.content;
+        }
+      }
+      
+      return historyMsg;
+    });
+}
+
 wss.on("connection", async (ws) => {
   console.log("[server] Browser connected — initializing...");
 
-  let session;
-  let extensionsResult;
-  let unsubscribe;
+  let currentSessionId = null;
+  let unsubscribe = null;
   let isReady = false;
   const messageQueue = [];
+
+  function broadcastSessionList() {
+    const list = Array.from(activeSessions.values()).map(s => ({
+      id: s.id,
+      title: s.title,
+      msgCount: s.msgCount,
+      created: s.created
+    }));
+    list.sort((a, b) => b.created - a.created);
+    ws.send(JSON.stringify({
+      type: "_bridge",
+      event: "session_list",
+      sessions: list,
+      activeSessionId: currentSessionId
+    }));
+  }
+
+  function setupSession(sess) {
+    if (unsubscribe) {
+      unsubscribe();
+    }
+    unsubscribe = sess.subscribe((eventData) => {
+      console.log(`[server] Agent event: ${eventData.type}`);
+      ws.send(JSON.stringify(eventData));
+    });
+  }
+
+  async function createNewSession() {
+    console.log("[server] Creating new AgentSession...");
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
+
+    try {
+      const skillPaths = [path.join(__dirname, ".pi", "skills")];
+      const extensionPaths = [path.join(__dirname, ".pi", "extensions")];
+      const services = await createAgentSessionServices({ 
+        cwd: CWD,
+        resourceLoaderOptions: {
+          additionalSkillPaths: skillPaths,
+          additionalExtensionPaths: extensionPaths
+        }
+      });
+      await services.resourceLoader.reload();
+      
+      // Use SessionManager.create to ensure persistent files!
+      const mgr = SessionManager.create(CWD);
+      
+      const result = await createAgentSession({
+        resourceLoader: services.resourceLoader,
+        model:        MODEL,
+        authStorage,
+        modelRegistry,
+        sessionManager: mgr
+      });
+      
+      const newSession = result.session;
+      await newSession.bindExtensions({});
+      
+      const id = newSession.id;
+      const sessionData = {
+        id,
+        session: newSession,
+        extensionsResult: result.extensionsResult,
+        manager: mgr,
+        title: "New session",
+        msgCount: 0,
+        created: Date.now(),
+        filePath: mgr.getSessionFile()
+      };
+      
+      activeSessions.set(id, sessionData);
+      currentSessionId = id;
+      
+      setupSession(newSession);
+      
+      ws.send(JSON.stringify({ 
+        type: "_bridge", 
+        event: "session_ready",
+        sessionId: id,
+        model: MODEL.id,
+        provider: MODEL.provider
+      }));
+      
+      broadcastSessionList();
+    } catch (err) {
+      console.error("[server] Failed to create session:", err);
+      ws.send(JSON.stringify({ type: "_bridge", event: "error", message: err.message }));
+    }
+  }
 
   // Command handler
   async function handleCommand(cmd) {
     console.log(`[server] Received command: ${cmd.type}`);
     
     if (cmd.type === "prompt") {
-      if (!session) return;
-      await session.prompt(cmd.message);
-    } else if (cmd.type === "new_session" || cmd.type === "newSession") {
-      console.log("[server] Creating new AgentSession...");
-      if (session) {
-        if (unsubscribe) unsubscribe();
-        session.dispose();
+      const sessionData = activeSessions.get(currentSessionId);
+      if (!sessionData) return;
+      
+      // Ensure booted lazily
+      const bootedSession = await ensureSessionBooted(sessionData);
+      
+      if (sessionData.title === "New session" && typeof cmd.message === "string") {
+        const newTitle = cmd.message.slice(0, 36) + (cmd.message.length > 36 ? "…" : "");
+        sessionData.title = newTitle;
+        if (sessionData.manager) {
+          sessionData.manager.appendSessionInfo(newTitle);
+        }
       }
+      sessionData.msgCount += 2;
+      broadcastSessionList();
 
-      try {
-        const skillPaths = [path.join(__dirname, ".pi", "skills")];
-        const extensionPaths = [path.join(__dirname, ".pi", "extensions")];
-        const services = await createAgentSessionServices({ 
-          cwd: CWD,
-          resourceLoaderOptions: {
-            additionalSkillPaths: skillPaths,
-            additionalExtensionPaths: extensionPaths
-          }
-        });
-        await services.resourceLoader.reload();
+      await bootedSession.prompt(cmd.message);
+    } else if (cmd.type === "new_session" || cmd.type === "newSession") {
+      await createNewSession();
+    } else if (cmd.type === "switchSession") {
+      const sessionData = activeSessions.get(cmd.sessionId);
+      if (sessionData) {
+        currentSessionId = cmd.sessionId;
         
-        const result = await createAgentSession({
-          resourceLoader: services.resourceLoader,
-          model:        MODEL,
-          authStorage,
-          modelRegistry,
-          sessionManager: SessionManager.inMemory()
-        });
-        session = result.session;
-        await session.bindExtensions({});
-        extensionsResult = result.extensionsResult;
-
-        setupSession(session, extensionsResult);
+        // Ensure booted lazily
+        const bootedSession = await ensureSessionBooted(sessionData);
+        setupSession(bootedSession);
         
         ws.send(JSON.stringify({ 
           type: "_bridge", 
           event: "session_ready",
-          sessionId: session.id,
+          sessionId: currentSessionId,
           model: MODEL.id,
-          provider: MODEL.provider
+          provider: MODEL.provider,
+          history: getHistory(bootedSession)
         }));
-      } catch (err) {
-        console.error("[server] Failed to create session:", err);
-        ws.send(JSON.stringify({ type: "_bridge", event: "error", message: err.message }));
+        broadcastSessionList();
+      }
+    } else if (cmd.type === "deleteSession") {
+      const targetId = cmd.sessionId;
+      const sessionData = activeSessions.get(targetId);
+      if (sessionData) {
+        if (sessionData.session) {
+          sessionData.session.dispose();
+        }
+        // Delete the file from disk if it exists
+        if (sessionData.filePath && fs.existsSync(sessionData.filePath)) {
+          try {
+            fs.unlinkSync(sessionData.filePath);
+            console.log(`[server] Deleted session file: ${sessionData.filePath}`);
+          } catch (err) {
+            console.error(`[server] Failed to delete session file:`, err);
+          }
+        }
+        activeSessions.delete(targetId);
+      }
+      
+      if (currentSessionId === targetId) {
+        const remaining = Array.from(activeSessions.values()).sort((a, b) => b.created - a.created);
+        if (remaining.length > 0) {
+          const latest = remaining[0];
+          currentSessionId = latest.id;
+          
+          const bootedSession = await ensureSessionBooted(latest);
+          setupSession(bootedSession);
+          
+          ws.send(JSON.stringify({ 
+            type: "_bridge", 
+            event: "session_ready",
+            sessionId: currentSessionId,
+            model: MODEL.id,
+            provider: MODEL.provider,
+            history: getHistory(bootedSession)
+          }));
+          broadcastSessionList();
+        } else {
+          await createNewSession();
+        }
+      } else {
+        broadcastSessionList();
       }
     } else if (cmd.type === "abort") {
       console.log("[server] Aborting session...");
-      if (session && session.abort) {
-        await session.abort();
+      const sessionData = activeSessions.get(currentSessionId);
+      if (sessionData && sessionData.session && sessionData.session.abort) {
+        await sessionData.session.abort();
       }
     }
   }
@@ -145,56 +415,30 @@ wss.on("connection", async (ws) => {
     }
   });
 
-  function setupSession(sess, extRes) {
-    // Pipe all agent events to the browser
-    unsubscribe = sess.subscribe((eventData) => {
-      console.log(`[server] Agent event: ${eventData.type} ${eventData.type === 'auto_retry_start' || eventData.type === 'message_end' ? JSON.stringify(eventData) : ''}`);
-      ws.send(JSON.stringify(eventData));
-    });
-  }
-
   // Initial boot
   try {
-    const skillPaths = [path.join(__dirname, ".pi", "skills")];
-    const extensionPaths = [path.join(__dirname, ".pi", "extensions")];
-    const services = await createAgentSessionServices({ 
-      cwd: CWD,
-      resourceLoaderOptions: {
-        additionalSkillPaths: skillPaths,
-        additionalExtensionPaths: extensionPaths
-      }
-    });
-    await services.resourceLoader.reload();
-    
-    const extensionsRes = services.resourceLoader.getExtensions();
-    const skillsResult = services.resourceLoader.getSkills();
-
-    console.log(`[server] Found ${extensionsRes.extensions.length} extensions and ${skillsResult.skills.length} skills`);
-
-    const result = await createAgentSession({
-      resourceLoader: services.resourceLoader,
-      model:        MODEL,
-      authStorage,
-      modelRegistry,
-      sessionManager: SessionManager.inMemory()
-    });
-    session = result.session;
-    await session.bindExtensions({});
-    extensionsResult = result.extensionsResult;
-    console.log(`[server] Active agent tools: ${session.agent.state.tools.map(t => t.name).join(", ")}`);
-
-    setupSession(session, extensionsResult);
-    
-    isReady = true;
-    console.log(`[server] Agent ready. Processing ${messageQueue.length} queued commands.`);
-
-    ws.send(JSON.stringify({ 
-      type: "_bridge", 
-      event: "session_ready",
-      sessionId: session.id,
-      model: MODEL.id,
-      provider: MODEL.provider
-    }));
+    if (activeSessions.size > 0) {
+      const sorted = Array.from(activeSessions.values()).sort((a, b) => b.created - a.created);
+      const latest = sorted[0];
+      currentSessionId = latest.id;
+      
+      const bootedSession = await ensureSessionBooted(latest);
+      setupSession(bootedSession);
+      
+      isReady = true;
+      ws.send(JSON.stringify({ 
+        type: "_bridge", 
+        event: "session_ready",
+        sessionId: currentSessionId,
+        model: MODEL.id,
+        provider: MODEL.provider,
+        history: getHistory(bootedSession)
+      }));
+      broadcastSessionList();
+    } else {
+      await createNewSession();
+      isReady = true;
+    }
 
     // Drain queue
     while (messageQueue.length > 0) {
@@ -210,6 +454,5 @@ wss.on("connection", async (ws) => {
   ws.on("close", () => {
     console.log("[server] Browser disconnected");
     if (unsubscribe) unsubscribe();
-    if (session) session.dispose();
   });
 });

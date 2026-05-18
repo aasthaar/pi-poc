@@ -100,15 +100,24 @@
   #session-list::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 2px; }
 
   .session-item {
+    position: relative;
     padding: 9px 14px;
     cursor: pointer;
     border-left: 2px solid transparent;
     transition: background 0.12s, border-color 0.12s;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
   }
   .session-item:hover { background: var(--surface-2); }
   .session-item.active {
     background: var(--surface-2);
     border-left-color: var(--accent);
+  }
+  .session-item-content {
+    flex: 1;
+    min-width: 0;
   }
   .session-item-title {
     font-size: 11.5px;
@@ -122,6 +131,25 @@
     font-size: 10px;
     color: var(--fg-dimmer);
     margin-top: 2px;
+  }
+  .session-delete-btn {
+    opacity: 0;
+    background: none;
+    border: none;
+    color: var(--fg-dimmer);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: opacity 0.15s, color 0.15s, background 0.15s;
+    line-height: 1;
+  }
+  .session-item:hover .session-delete-btn {
+    opacity: 1;
+  }
+  .session-delete-btn:hover {
+    color: var(--red);
+    background: rgba(248, 113, 113, 0.1);
   }
 
   /* ── Main column ──────────────────────────────────────────────────── */
@@ -568,16 +596,6 @@ const logEmptyMsg   = document.getElementById("log-empty-msg");
 const thinkGlobal   = document.getElementById("think-global-toggle");
 
 // ── Session management ────────────────────────────────────────────────────
-function createSession(firstMsg) {
-  const id = Date.now();
-  const title = firstMsg ? firstMsg.slice(0, 36) + (firstMsg.length > 36 ? "…" : "") : "New session";
-  const sess = { id, title, time: new Date(), msgCount: 0 };
-  sessions.unshift(sess);
-  currentSessionId = id;
-  renderSessionList();
-  return sess;
-}
-
 function renderSessionList() {
   if (!sessions.length) {
     sessionList.innerHTML = '<div class="log-empty">No sessions yet</div>';
@@ -585,15 +603,37 @@ function renderSessionList() {
   }
   sessionList.innerHTML = sessions.map(s => `
     <div class="session-item ${s.id === currentSessionId ? 'active' : ''}" data-id="${s.id}">
-      <div class="session-item-title">${escHtml(s.title)}</div>
-      <div class="session-item-meta">${s.time.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · ${s.msgCount} msg${s.msgCount!==1?'s':''}</div>
+      <div class="session-item-content">
+        <div class="session-item-title">${escHtml(s.title)}</div>
+        <div class="session-item-meta">${s.time.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} · ${s.msgCount} msg${s.msgCount!==1?'s':''}</div>
+      </div>
+      <button class="session-delete-btn" title="Delete session">×</button>
     </div>
   `).join('');
+  
   sessionList.querySelectorAll('.session-item').forEach(el => {
-    el.addEventListener('click', () => {
-      // visual-only: just highlight (actual session switch would need server support)
-      currentSessionId = parseInt(el.dataset.id);
+    const targetId = el.dataset.id;
+    
+    el.querySelector('.session-item-content').addEventListener('click', () => {
+      if (targetId === currentSessionId) return;
+      currentSessionId = targetId;
       renderSessionList();
+      
+      messagesEl.innerHTML = '';
+      clearLog();
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "switchSession", sessionId: targetId }));
+      }
+    });
+
+    el.querySelector('.session-delete-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (confirm("Are you sure you want to delete this session?")) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "deleteSession", sessionId: targetId }));
+        }
+      }
     });
   });
 }
@@ -603,14 +643,12 @@ function escHtml(s) {
 }
 
 newSessionBtn.addEventListener('click', () => {
-  // Send new session signal to server (optional: server may not support, but track client-side)
   messagesEl.innerHTML = '';
   clearLog();
   currentAgentMsgEl = null;
   currentBodyEl = null;
   currentThinkingEl = null;
-  createSession("New session");
-  addSystemMsg("New session started.");
+  addSystemMsg("Starting new session...");
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "newSession" }));
   }
@@ -918,6 +956,24 @@ function handleEvent(ev) {
         addSystemMsg(`pi process exited (code ${ev.code}).`);
       } else if (ev.event === "session_ready") {
         addSystemMsg(`Session ready · model: ${ev.model}`);
+        if (ev.history) {
+          messagesEl.innerHTML = '';
+          clearLog();
+          for (const msg of ev.history) {
+            renderHistoryMessage(msg);
+          }
+        }
+        currentSessionId = ev.sessionId;
+        renderSessionList();
+      } else if (ev.event === "session_list") {
+        sessions = ev.sessions.map(s => ({
+          id: s.id,
+          title: s.title,
+          time: new Date(s.created),
+          msgCount: s.msgCount
+        }));
+        currentSessionId = ev.activeSessionId;
+        renderSessionList();
       } else if (ev.event === "error") {
         addSystemMsg(`Server error: ${ev.message}`);
       }
@@ -939,6 +995,84 @@ function detectSkill(toolName, args) {
   if (t.includes("thesis") || t.includes("stellar")) return "stellar-thesis";
   // fallback: only return the name if it looks like a real tool
   return (toolName.length < 20 && toolName !== "tool") ? toolName : null;
+}
+
+function renderHistoryMessage(msg) {
+  const el = document.createElement("div");
+  el.className = `msg ${msg.role === 'user' ? 'user' : 'agent'}`;
+
+  const meta = document.createElement("div");
+  meta.className = "msg-meta";
+
+  const roleSpan = document.createElement("span");
+  roleSpan.className = "msg-role";
+  roleSpan.textContent = msg.role === "user" ? "you" : "pi";
+
+  const metaRight = document.createElement("div");
+  metaRight.className = "msg-meta-right";
+
+  const timeSpan = document.createElement("span");
+  timeSpan.className = "msg-time";
+  timeSpan.textContent = new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  metaRight.appendChild(timeSpan);
+
+  if (msg.role === "assistant") {
+    let skillName = null;
+    if (msg.toolCalls && msg.toolCalls.length > 0) {
+      skillName = detectSkill(msg.toolCalls[0].name, msg.toolCalls[0].arguments);
+    }
+    if (skillName) {
+      const skillTag = document.createElement("span");
+      skillTag.className = "msg-skill-tag";
+      skillTag.textContent = skillName;
+      metaRight.appendChild(skillTag);
+    }
+
+    if (msg.thinking) {
+      const thinkBtn = document.createElement("button");
+      thinkBtn.className = "think-toggle-btn has-thinking";
+      thinkBtn.textContent = thinkingGlobalVisible ? '▼ thinking' : '▶ thinking';
+      thinkBtn.addEventListener("click", () => {
+        const tb = el.querySelector('.thinking-block');
+        if (!tb) return;
+        const isCollapsed = tb.classList.toggle('collapsed');
+        thinkBtn.textContent = isCollapsed ? '▶ thinking' : '▼ thinking';
+      });
+      metaRight.appendChild(thinkBtn);
+    }
+  }
+
+  meta.appendChild(roleSpan);
+  meta.appendChild(metaRight);
+
+  const body = document.createElement("div");
+  body.className = "msg-body";
+
+  if (msg.role === "assistant") {
+    if (msg.thinking) {
+      const thinkingEl = document.createElement("div");
+      thinkingEl.className = "thinking-block" + (thinkingGlobalVisible ? "" : " collapsed");
+      thinkingEl.textContent = msg.thinking;
+      body.appendChild(thinkingEl);
+    }
+    
+    if (msg.toolCalls) {
+      for (const tc of msg.toolCalls) {
+        const badge = document.createElement("div");
+        badge.className = "tool-badge";
+        badge.textContent = `${tc.name}(${summarizeArgs(tc.arguments)})`;
+        body.appendChild(badge);
+      }
+    }
+  }
+
+  if (msg.content) {
+    body.appendChild(document.createTextNode(msg.content));
+  }
+
+  el.appendChild(meta);
+  el.appendChild(body);
+  messagesEl.appendChild(el);
 }
 
 // ── DOM helpers ───────────────────────────────────────────────────────────
@@ -995,7 +1129,6 @@ function createMsgEl(role) {
 
   // Update session
   if (role === "user" || role === "agent") {
-    if (!currentSessionId) createSession("");
     const sess = sessions.find(s => s.id === currentSessionId);
     if (sess) { sess.msgCount++; renderSessionList(); }
   }
@@ -1038,16 +1171,6 @@ function summarizeArgs(args) {
 function sendPrompt() {
   const text = promptEl.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-  // Create session on first message
-  if (!currentSessionId) createSession(text);
-  else {
-    const sess = sessions.find(s => s.id === currentSessionId);
-    if (sess && sess.title === "New session") {
-      sess.title = text.slice(0, 36) + (text.length > 36 ? "…" : "");
-      renderSessionList();
-    }
-  }
 
   const msgEl = createMsgEl("user");
   msgEl.querySelector(".msg-body").textContent = text;
