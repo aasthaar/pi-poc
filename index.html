@@ -443,9 +443,55 @@
     background: var(--surface);
     padding: 12px 16px;
     display: flex;
-    gap: 10px;
-    align-items: flex-end;
+    flex-direction: column;
+    gap: 8px;
     flex-shrink: 0;
+  }
+  .input-row {
+    display: flex;
+    gap: 10px;
+    width: 100%;
+    align-items: flex-end;
+  }
+  #attachments-preview {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+    padding-bottom: 4px;
+  }
+  .attachment-preview-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #131620;
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    transition: all 0.2s ease;
+  }
+  .attachment-preview-pill:hover {
+    background: #1a1e2b;
+    border-color: var(--accent-2);
+  }
+  .attachment-preview-pill img {
+    width: 16px;
+    height: 16px;
+    border-radius: 2px;
+    object-fit: cover;
+  }
+  .attachment-preview-pill .remove-btn {
+    cursor: pointer;
+    font-weight: bold;
+    color: var(--fg-dimmer);
+    margin-left: 6px;
+    font-size: 12px;
+    transition: color 0.15s;
+  }
+  .attachment-preview-pill .remove-btn:hover {
+    color: var(--red);
   }
 
   #prompt {
@@ -546,9 +592,14 @@
     </div>
 
     <div id="input-area">
-      <textarea id="prompt" rows="1" placeholder="Ask pi anything… (Enter to send, Shift+Enter for newline)"></textarea>
-      <button class="btn" id="send-btn" disabled>Send</button>
-      <button class="btn" id="abort-btn">Abort</button>
+      <div id="attachments-preview" style="display: none;"></div>
+      <div class="input-row">
+        <input type="file" id="file-input" multiple style="display: none;" accept="image/*,text/*,.js,.py,.json,.css,.html,.ts,.tsx,.rs,.go,.md,.yml,.yaml,.xml,.sh">
+        <button class="btn" id="attach-btn" title="Attach file or image" style="background: #181b23; border: 1px solid var(--border-2); color: var(--fg-dim); font-size: 15px; padding: 0 12px; height: 38px; border-radius: var(--radius);">📎</button>
+        <textarea id="prompt" rows="1" placeholder="Ask pi anything… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button class="btn" id="send-btn" disabled>Send</button>
+        <button class="btn" id="abort-btn">Abort</button>
+      </div>
     </div>
   </div>
 
@@ -573,6 +624,7 @@ let activeLogEntry = null;
 let thinkingGlobalVisible = true; // global toggle state
 let sessions = [];   // { id, title, time, msgs }
 let currentSessionId = null;
+let pendingAttachments = []; // { type: 'image'|'text', name: string, base64?: string, mediaType?: string, text?: string }
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const messagesEl    = document.getElementById("messages");
@@ -594,6 +646,9 @@ const logClear      = document.getElementById("log-clear");
 const logToggle     = document.getElementById("log-toggle");
 const logEmptyMsg   = document.getElementById("log-empty-msg");
 const thinkGlobal   = document.getElementById("think-global-toggle");
+const attachmentsPreview = document.getElementById("attachments-preview");
+const fileInput     = document.getElementById("file-input");
+const attachBtn     = document.getElementById("attach-btn");
 
 // ── Session management ────────────────────────────────────────────────────
 function renderSessionList() {
@@ -1168,19 +1223,149 @@ function summarizeArgs(args) {
   return val.length > 40 ? val.slice(0, 40) + "…" : val;
 }
 
+attachBtn.addEventListener("click", () => {
+  fileInput.click();
+});
+
+fileInput.addEventListener("change", async (e) => {
+  const files = Array.from(e.target.files);
+  if (files.length === 0) return;
+  
+  for (const file of files) {
+    if (file.size > 10 * 1024 * 1024) {
+      alert(`File ${file.name} is too large. Max size is 10MB.`);
+      continue;
+    }
+    if (pendingAttachments.some(a => a.name === file.name)) {
+      continue;
+    }
+    
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = reader.result.split(',')[1];
+        pendingAttachments.push({
+          type: "image",
+          name: file.name,
+          base64: base64,
+          mediaType: file.type
+        });
+        renderAttachments();
+      };
+      reader.readAsDataURL(file);
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        pendingAttachments.push({
+          type: "text",
+          name: file.name,
+          text: reader.result
+        });
+        renderAttachments();
+      };
+      reader.readAsText(file);
+    }
+  }
+  fileInput.value = "";
+});
+
+function renderAttachments() {
+  if (pendingAttachments.length === 0) {
+    attachmentsPreview.style.display = "none";
+    attachmentsPreview.innerHTML = "";
+    return;
+  }
+  
+  attachmentsPreview.style.display = "flex";
+  attachmentsPreview.innerHTML = pendingAttachments.map((att, idx) => {
+    let icon = "📄";
+    if (att.type === "image") {
+      return `
+        <div class="attachment-preview-pill" data-idx="${idx}">
+          <img src="data:${att.mediaType};base64,${att.base64}" alt="${att.name}">
+          <span>${escHtml(att.name)}</span>
+          <span class="remove-btn" onclick="removeAttachment(${idx})">×</span>
+        </div>
+      `;
+    }
+    if (att.name.endsWith(".js") || att.name.endsWith(".ts") || att.name.endsWith(".tsx")) icon = "🟨";
+    else if (att.name.endsWith(".py")) icon = "🐍";
+    else if (att.name.endsWith(".json")) icon = "⚙️";
+    else if (att.name.endsWith(".css") || att.name.endsWith(".html")) icon = "🎨";
+    else if (att.name.endsWith(".md")) icon = "📝";
+    
+    return `
+      <div class="attachment-preview-pill" data-idx="${idx}">
+        <span>${icon}</span>
+        <span>${escHtml(att.name)}</span>
+        <span class="remove-btn" onclick="removeAttachment(${idx})">×</span>
+      </div>
+    `;
+  }).join("");
+}
+
+window.removeAttachment = function(idx) {
+  pendingAttachments.splice(idx, 1);
+  renderAttachments();
+};
+
 function sendPrompt() {
-  const text = promptEl.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const rawText = promptEl.value;
+  const hasText = rawText.trim().length > 0;
+  const hasAttachments = pendingAttachments.length > 0;
+  if ((!hasText && !hasAttachments) || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  let finalPromptMessage = rawText;
+  const textAttachments = pendingAttachments.filter(a => a.type === "text");
+  if (textAttachments.length > 0) {
+    let appends = "\n\n--- Attached Files ---";
+    for (const file of textAttachments) {
+      const ext = file.name.split('.').pop() || "";
+      appends += `\n\n[Attached file: ${file.name}]\n\`\`\`${ext}\n${file.text}\n\`\`\``;
+    }
+    finalPromptMessage += appends;
+  }
+
+  const images = pendingAttachments
+    .filter(a => a.type === "image")
+    .map(a => ({
+      mediaType: a.mediaType,
+      base64: a.base64
+    }));
 
   const msgEl = createMsgEl("user");
-  msgEl.querySelector(".msg-body").textContent = text;
+  const bodyEl = msgEl.querySelector(".msg-body");
+  bodyEl.textContent = rawText.trim() || `Sent ${pendingAttachments.length} file${pendingAttachments.length !== 1 ? 's' : ''}`;
+  
+  const imageAttachments = pendingAttachments.filter(a => a.type === "image");
+  if (imageAttachments.length > 0) {
+    const imgContainer = document.createElement("div");
+    imgContainer.style.display = "flex";
+    imgContainer.style.gap = "8px";
+    imgContainer.style.marginTop = "8px";
+    imgContainer.style.flexWrap = "wrap";
+    for (const img of imageAttachments) {
+      const imgEl = document.createElement("img");
+      imgEl.src = `data:${img.mediaType};base64,${img.base64}`;
+      imgEl.style.maxWidth = "200px";
+      imgEl.style.maxHeight = "150px";
+      imgEl.style.borderRadius = "6px";
+      imgEl.style.border = "1px solid var(--border-2)";
+      imgEl.style.objectFit = "cover";
+      imgContainer.appendChild(imgEl);
+    }
+    bodyEl.appendChild(imgContainer);
+  }
 
   const cmd = streaming
-    ? { type: "prompt", message: text, streamingBehavior: "followUp" }
-    : { type: "prompt", message: text };
+    ? { type: "prompt", message: finalPromptMessage, streamingBehavior: "followUp", images: images.length > 0 ? images : undefined }
+    : { type: "prompt", message: finalPromptMessage, images: images.length > 0 ? images : undefined };
+    
   ws.send(JSON.stringify(cmd));
 
   promptEl.value = "";
+  pendingAttachments = [];
+  renderAttachments();
   autoResize();
   promptEl.focus();
 }

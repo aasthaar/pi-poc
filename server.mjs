@@ -235,7 +235,7 @@ wss.on("connection", async (ws) => {
       unsubscribe();
     }
     unsubscribe = sess.subscribe((eventData) => {
-      console.log(`[server] Agent event: ${eventData.type}`);
+      console.log(`[server] Agent event: ${eventData.type} - ${JSON.stringify(eventData).slice(0, 300)}`);
       ws.send(JSON.stringify(eventData));
     });
   }
@@ -326,7 +326,16 @@ wss.on("connection", async (ws) => {
       sessionData.msgCount += 2;
       broadcastSessionList();
 
-      await bootedSession.prompt(cmd.message);
+      const images = cmd.images ? cmd.images.map(img => ({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: img.mediaType,
+          data: img.base64
+        }
+      })) : undefined;
+
+      await bootedSession.prompt(cmd.message, { images });
     } else if (cmd.type === "new_session" || cmd.type === "newSession") {
       await createNewSession();
     } else if (cmd.type === "switchSession") {
