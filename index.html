@@ -749,7 +749,7 @@ function connect() {
 
   ws.onerror = () => {
     dot.className = "status-dot error";
-    statusText.textContent = "error — is server.js running?";
+    statusText.textContent = "error — is server.mjs running?";
   };
 
   ws.onmessage = ({ data }) => {
@@ -916,6 +916,10 @@ function handleEvent(ev) {
     case "_bridge":
       if (ev.event === "agent_exited") {
         addSystemMsg(`pi process exited (code ${ev.code}).`);
+      } else if (ev.event === "session_ready") {
+        addSystemMsg(`Session ready · model: ${ev.model}`);
+      } else if (ev.event === "error") {
+        addSystemMsg(`Server error: ${ev.message}`);
       }
       break;
   }
