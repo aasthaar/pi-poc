@@ -9,8 +9,11 @@ packages/*/dist-chrome/
 packages/*/dist-firefox/
 *.cpuprofile
 
-# Environment
+# Environment & Secrets
 .env
+auth-url.txt
+credentials.json
+token.json
 
 # Editor files
 .vscode/
