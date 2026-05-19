@@ -328,14 +328,21 @@ wss.on("connection", async (ws) => {
 
       const images = cmd.images ? cmd.images.map(img => ({
         type: "image",
-        source: {
-          type: "base64",
-          media_type: img.mediaType,
-          data: img.base64
-        }
+        mimeType: img.mediaType,
+        data: img.base64
       })) : undefined;
 
-      await bootedSession.prompt(cmd.message, { images });
+      try {
+        await bootedSession.prompt(cmd.message, { images });
+      } catch (error) {
+        if (images && images.length > 0) {
+          console.warn("[server] Vision prompt failed, falling back to text-only prompt:", error.message || error);
+          const fallbackText = `${cmd.message}\n\n[Note: Vision model was unavailable. Processing text-only fallback.]`;
+          await bootedSession.prompt(fallbackText);
+        } else {
+          throw error;
+        }
+      }
     } else if (cmd.type === "new_session" || cmd.type === "newSession") {
       await createNewSession();
     } else if (cmd.type === "switchSession") {

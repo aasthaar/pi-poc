@@ -336,11 +336,28 @@
     color: var(--fg-dim);
     font-size: 12px;
     margin-bottom: 8px;
-    max-height: 120px;
-    overflow: hidden;
+    max-height: 150px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 2px;
     transition: max-height 0.3s ease, opacity 0.2s ease;
   }
-  .thinking-block.collapsed { max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; margin-bottom: 0; }
+  /* Webkit custom scrollbars for thinking blocks to keep them sleek */
+  .thinking-block::-webkit-scrollbar {
+    width: 4px;
+  }
+  .thinking-block::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .thinking-block::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 2px;
+  }
+  .thinking-block::-webkit-scrollbar-thumb:hover {
+    background: var(--accent);
+  }
+  .thinking-block.collapsed { max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; margin-bottom: 0; overflow: hidden; }
 
   /* Streaming cursor */
   .cursor { display: inline-block; width: 7px; height: 13px; background: var(--accent); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s step-end infinite; }
@@ -1121,8 +1138,53 @@ function renderHistoryMessage(msg) {
     }
   }
 
-  if (msg.content) {
-    body.appendChild(document.createTextNode(msg.content));
+  let mainContent = msg.content || "";
+  const attachedFiles = [];
+  
+  if (mainContent.includes("\n\n--- Attached Files ---")) {
+    const parts = mainContent.split("\n\n--- Attached Files ---");
+    mainContent = parts[0];
+    const attachmentsSection = parts[1];
+    
+    // Parse individual attachments
+    const fileRegex = /\[Attached file:\s*([^\]]+)\]\n```[^\n]*\n([\s\S]*?)```/g;
+    let match;
+    while ((match = fileRegex.exec(attachmentsSection)) !== null) {
+      attachedFiles.push({
+        name: match[1]
+      });
+    }
+  }
+
+  if (mainContent) {
+    body.appendChild(document.createTextNode(mainContent));
+  }
+
+  if (attachedFiles.length > 0) {
+    const docContainer = document.createElement("div");
+    docContainer.style.display = "flex";
+    docContainer.style.gap = "8px";
+    docContainer.style.marginTop = "8px";
+    docContainer.style.flexWrap = "wrap";
+    for (const file of attachedFiles) {
+      const pill = document.createElement("div");
+      pill.className = "attachment-preview-pill";
+      pill.style.cursor = "default";
+      
+      let icon = "📄";
+      if (file.name.endsWith(".js") || file.name.endsWith(".ts") || file.name.endsWith(".tsx")) icon = "🟨";
+      else if (file.name.endsWith(".py")) icon = "🐍";
+      else if (file.name.endsWith(".json")) icon = "⚙️";
+      else if (file.name.endsWith(".css") || file.name.endsWith(".html")) icon = "🎨";
+      else if (file.name.endsWith(".md")) icon = "📝";
+      
+      pill.innerHTML = `
+        <span>${icon}</span>
+        <span>${escHtml(file.name)}</span>
+      `;
+      docContainer.appendChild(pill);
+    }
+    body.appendChild(docContainer);
   }
 
   el.appendChild(meta);
@@ -1336,7 +1398,33 @@ function sendPrompt() {
   const msgEl = createMsgEl("user");
   const bodyEl = msgEl.querySelector(".msg-body");
   bodyEl.textContent = rawText.trim() || `Sent ${pendingAttachments.length} file${pendingAttachments.length !== 1 ? 's' : ''}`;
-  
+  if (textAttachments.length > 0) {
+    const docContainer = document.createElement("div");
+    docContainer.style.display = "flex";
+    docContainer.style.gap = "8px";
+    docContainer.style.marginTop = "8px";
+    docContainer.style.flexWrap = "wrap";
+    for (const file of textAttachments) {
+      const pill = document.createElement("div");
+      pill.className = "attachment-preview-pill";
+      pill.style.cursor = "default";
+      
+      let icon = "📄";
+      if (file.name.endsWith(".js") || file.name.endsWith(".ts") || file.name.endsWith(".tsx")) icon = "🟨";
+      else if (file.name.endsWith(".py")) icon = "🐍";
+      else if (file.name.endsWith(".json")) icon = "⚙️";
+      else if (file.name.endsWith(".css") || file.name.endsWith(".html")) icon = "🎨";
+      else if (file.name.endsWith(".md")) icon = "📝";
+      
+      pill.innerHTML = `
+        <span>${icon}</span>
+        <span>${escHtml(file.name)}</span>
+      `;
+      docContainer.appendChild(pill);
+    }
+    bodyEl.appendChild(docContainer);
+  }
+
   const imageAttachments = pendingAttachments.filter(a => a.type === "image");
   if (imageAttachments.length > 0) {
     const imgContainer = document.createElement("div");
